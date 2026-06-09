@@ -1,13 +1,13 @@
 package com.zqstudio.easyxposed;
 
 import android.app.Application;
+import android.app.AndroidAppHelper;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
 
 import java.util.List;
 
-import de.robv.android.xposed.AndroidAppHelper;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -139,18 +139,14 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         String[] routes = new String[] {
-                // ---------------------------------------------------
                 // 局域网 / 私有地址
-                // ---------------------------------------------------
                 "10.0.0.0/8",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
                 "127.0.0.0/8",
                 "169.254.0.0/16",
 
-                // ---------------------------------------------------
                 // 国内常见 IPv4 大段，网页分流测试用
-                // ---------------------------------------------------
                 "1.0.1.0/24",
                 "1.0.2.0/23",
                 "1.0.8.0/21",
