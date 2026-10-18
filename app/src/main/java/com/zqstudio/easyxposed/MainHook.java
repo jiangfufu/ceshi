@@ -1,240 +1,179 @@
 package com.zqstudio.easyxposed;
 
 import android.app.Application;
-import android.app.AndroidAppHelper;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
+import android.database.Cursor;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
 
-import java.util.List;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.lang.reflect.Method;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-public class MainHook implements IXposedHookLoadPackage {
+public class NodeExporter {
 
-    private static final String TAG = "[ForceGlobal] ";
+    private static final String TAG = "[NodeExport] ";
+    private static final String V2RAYNG_PKG = "com.v2ray.ang";
+    private static final String FILE_NAME = "v2rayng_node.txt";
 
-    @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+    // 不同版本类所在的包不同，依次尝试
+    private static final String[] ANG_MANAGER = {
+            "com.v2ray.ang.handler.AngConfigManager",
+            "com.v2ray.ang.util.AngConfigManager"
+    };
+    private static final String[] MMKV_MANAGER = {
+            "com.v2ray.ang.handler.MmkvManager",
+            "com.v2ray.ang.util.MmkvManager"
+    };
 
-        XposedBridge.log(TAG + "加载包名: " + lpparam.packageName);
+    private static String lastLink = "";
 
-        // -----------------------------------------------------------
-        // 1. 拦截黑名单，防止 VPN App 排除应用
-        // -----------------------------------------------------------
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.net.VpnService$Builder",
-                    lpparam.classLoader,
-                    "addDisallowedApplication",
-                    String.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            String pkg = String.valueOf(param.args[0]);
-
-                            XposedBridge.log(TAG + "拦截黑名单: " + pkg);
-
-                            // 直接返回 Builder 对象，跳过原方法
-                            param.setResult(param.thisObject);
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "Hook addDisallowedApplication 失败: " + t.getMessage());
-        }
-
-        // -----------------------------------------------------------
-        // 2. Hook establish，在 VPN 建立前修改规则
-        // -----------------------------------------------------------
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.net.VpnService$Builder",
-                    lpparam.classLoader,
-                    "establish",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            Application app = AndroidAppHelper.currentApplication();
-
-                            if (app == null) {
-                                XposedBridge.log(TAG + "currentApplication 为空，跳过");
-                                return;
-                            }
-
-                            String myPkg = app.getPackageName();
-                            PackageManager pm = app.getPackageManager();
-                            Object builder = param.thisObject;
-
-                            XposedBridge.log(TAG + "正在处理 VPN App: " + myPkg);
-
-                            // 2.1 强制所有 App 加入 VPN 白名单
-                            addAllAppsToVpn(builder, pm, myPkg);
-
-                            // 2.2 安卓 13+ 排除国内 IP 路由，实现国内直连
-                            excludeChinaRoutes(builder);
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "Hook establish 失败: " + t.getMessage());
-        }
+    public static boolean isTarget(String pkg) {
+        return V2RAYNG_PKG.equals(pkg);
     }
 
-    /**
-     * 把所有已安装 App 加入 VPN allowedApplication 白名单
-     */
-    private void addAllAppsToVpn(Object builder, PackageManager pm, String myPkg) {
+    /** 在 VPN 建立时调用：取出当前选中节点，导出为分享链接 */
+    public static void export(Application app, ClassLoader cl) {
         try {
-            List<PackageInfo> packages = pm.getInstalledPackages(0);
-
-            int count = 0;
-
-            for (PackageInfo info : packages) {
-                if (info == null || info.packageName == null) {
-                    continue;
-                }
-
-                String pkg = info.packageName;
-
-                // 排除 VPN 自身，避免 VPN App 自己走自己的 VPN 导致异常
-                if (pkg.equals(myPkg)) {
-                    continue;
-                }
-
-                try {
-                    XposedHelpers.callMethod(
-                            builder,
-                            "addAllowedApplication",
-                            pkg
-                    );
-
-                    count++;
-                } catch (Throwable e) {
-                    XposedBridge.log(TAG + "添加白名单失败: " + pkg + " / " + e.getMessage());
-                }
+            String guid = getSelectedGuid(cl);
+            if (guid == null || guid.isEmpty()) {
+                XposedBridge.log(TAG + "未取到当前节点 ID");
+                return;
             }
 
-            XposedBridge.log(TAG + "全局白名单注入完成，共添加: " + count);
+            String link = getShareLink(cl, guid);
+            if (link == null || link.isEmpty()) {
+                XposedBridge.log(TAG + "未能生成分享链接");
+                return;
+            }
 
-        } catch (Throwable e) {
-            XposedBridge.log(TAG + "注入 App 白名单失败: " + e.getMessage());
+            // 同一个节点重复连接时不重复写
+            if (link.equals(lastLink)) return;
+            lastLink = link;
+
+            save(app, link);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "导出失败: " + t);
         }
     }
 
-    /**
-     * 排除国内 IP / 局域网 IP，不走 VPN
-     *
-     * Android 13 / API 33 以上支持 VpnService.Builder.excludeRoute(IpPrefix)
-     * 安卓 16 可以使用。
-     */
-    private void excludeChinaRoutes(Object builder) {
-        if (Build.VERSION.SDK_INT < 33) {
-            XposedBridge.log(TAG + "当前系统低于 Android 13，不支持 excludeRoute，跳过国内直连");
-            return;
+    private static String getSelectedGuid(ClassLoader cl) {
+        Object mmkv = getKotlinObject(cl, MMKV_MANAGER);
+        if (mmkv == null) {
+            XposedBridge.log(TAG + "找不到 MmkvManager");
+            return null;
         }
+        try {
+            Object r = XposedHelpers.callMethod(mmkv, "getSelectServer");
+            return r == null ? null : r.toString();
+        } catch (Throwable t) {
+            logMethods(mmkv.getClass(), "select");
+            return null;
+        }
+    }
 
-        String[] routes = new String[] {
-                // 局域网 / 私有地址
-                "10.0.0.0/8",
-                "172.16.0.0/12",
-                "192.168.0.0/16",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
+    private static String getShareLink(ClassLoader cl, String guid) {
+        Object mgr = getKotlinObject(cl, ANG_MANAGER);
+        if (mgr == null) {
+            XposedBridge.log(TAG + "找不到 AngConfigManager");
+            return null;
+        }
+        try {
+            Object r = XposedHelpers.callMethod(mgr, "shareConfig", guid);
+            return r == null ? null : r.toString().trim();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "调用 shareConfig 失败: " + t);
+            logMethods(mgr.getClass(), "share");
+            return null;
+        }
+    }
 
-                // 国内常见 IPv4 大段，网页分流测试用
-                "1.0.1.0/24",
-                "1.0.2.0/23",
-                "1.0.8.0/21",
-                "1.0.32.0/19",
-
-                "14.16.0.0/12",
-                "27.8.0.0/13",
-                "27.16.0.0/12",
-
-                "36.0.0.0/8",
-                "39.0.0.0/8",
-                "42.0.0.0/8",
-
-                "49.4.0.0/14",
-                "49.64.0.0/11",
-
-                "58.0.0.0/8",
-                "59.0.0.0/8",
-                "60.0.0.0/8",
-                "61.0.0.0/8",
-
-                "101.0.0.0/8",
-                "103.0.0.0/8",
-                "106.0.0.0/8",
-
-                "110.0.0.0/8",
-                "111.0.0.0/8",
-                "112.0.0.0/8",
-                "113.0.0.0/8",
-                "114.0.0.0/8",
-                "115.0.0.0/8",
-                "116.0.0.0/8",
-                "117.0.0.0/8",
-                "118.0.0.0/8",
-                "119.0.0.0/8",
-
-                "120.0.0.0/8",
-                "121.0.0.0/8",
-                "122.0.0.0/8",
-                "123.0.0.0/8",
-                "124.0.0.0/8",
-                "125.0.0.0/8",
-
-                "139.0.0.0/8",
-                "140.0.0.0/8",
-                "144.0.0.0/8",
-                "150.0.0.0/8",
-                "153.0.0.0/8",
-                "157.0.0.0/8",
-                "163.0.0.0/8",
-                "171.0.0.0/8",
-                "175.0.0.0/8",
-
-                "180.0.0.0/8",
-                "182.0.0.0/8",
-                "183.0.0.0/8",
-
-                "202.0.0.0/8",
-                "203.0.0.0/8",
-                "210.0.0.0/8",
-                "211.0.0.0/8",
-
-                "218.0.0.0/8",
-                "219.0.0.0/8",
-                "220.0.0.0/8",
-                "221.0.0.0/8",
-                "222.0.0.0/8",
-                "223.0.0.0/8"
-        };
-
-        int success = 0;
-        int failed = 0;
-
-        for (String cidr : routes) {
+    /** 取 Kotlin object 单例（INSTANCE 字段） */
+    private static Object getKotlinObject(ClassLoader cl, String[] candidates) {
+        for (String name : candidates) {
+            Class<?> c = XposedHelpers.findClassIfExists(name, cl);
+            if (c == null) continue;
             try {
-                Class<?> ipPrefixClass = Class.forName("android.net.IpPrefix");
-                Object ipPrefix = XposedHelpers.newInstance(ipPrefixClass, cidr);
+                return XposedHelpers.getStaticObjectField(c, "INSTANCE");
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
 
-                XposedHelpers.callMethod(builder, "excludeRoute", ipPrefix);
+    /** 方法名对不上时，把相近的方法名打到日志里，方便排查 */
+    private static void logMethods(Class<?> c, String keyword) {
+        for (Method m : c.getDeclaredMethods()) {
+            if (m.getName().toLowerCase().contains(keyword)) {
+                XposedBridge.log(TAG + "候选方法: " + c.getSimpleName() + "." + m.getName());
+            }
+        }
+    }
 
-                success++;
-                XposedBridge.log(TAG + "国内直连路由成功: " + cidr);
-            } catch (Throwable e) {
-                failed++;
-                XposedBridge.log(TAG + "国内直连路由失败: " + cidr + " / " + e.getMessage());
+    private static void save(Application app, String content) {
+        byte[] data = (content + "\n").getBytes(StandardCharsets.UTF_8);
+
+        // 优先写到公共「下载」目录
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                saveToDownloads(app, data);
+                XposedBridge.log(TAG + "已写入 Download/" + FILE_NAME);
+                return;
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "写入下载目录失败，改用应用目录: " + t);
             }
         }
 
-        XposedBridge.log(TAG + "国内直连规则完成，成功: " + success + "，失败: " + failed);
+        // 备用：v2rayNG 自己的外部目录
+        try {
+            File dir = app.getExternalFilesDir(null);
+            if (dir == null) dir = app.getFilesDir();
+            File f = new File(dir, FILE_NAME);
+            try (OutputStream os = new FileOutputStream(f, false)) {
+                os.write(data);
+            }
+            XposedBridge.log(TAG + "已写入 " + f.getAbsolutePath());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "写文件失败: " + t);
+        }
+    }
+
+    private static void saveToDownloads(Application app, byte[] data) throws Exception {
+        ContentResolver cr = app.getContentResolver();
+        Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+        Uri target = null;
+
+        // 已有同名文件就覆盖，避免生成 xxx(1).txt
+        try (Cursor c = cr.query(collection,
+                new String[]{MediaStore.Downloads._ID},
+                MediaStore.Downloads.DISPLAY_NAME + "=?",
+                new String[]{FILE_NAME}, null)) {
+            if (c != null && c.moveToFirst()) {
+                target = ContentUris.withAppendedId(collection, c.getLong(0));
+            }
+        }
+
+        if (target == null) {
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Downloads.DISPLAY_NAME, FILE_NAME);
+            v.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
+            v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            target = cr.insert(collection, v);
+        }
+        if (target == null) throw new IllegalStateException("insert 返回空");
+
+        try (OutputStream os = cr.openOutputStream(target, "wt")) {
+            if (os == null) throw new IllegalStateException("无法打开输出流");
+            os.write(data);
+        }
     }
 }
