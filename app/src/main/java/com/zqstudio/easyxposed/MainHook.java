@@ -1,12 +1,13 @@
 package com.zqstudio.easyxposed;
 
-import android.app.Application;
+import android.annotation.SuppressLint;
 import android.app.AndroidAppHelper;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
+import android.app.Application;
+import android.net.IpPrefix;
+import android.net.VpnService;
 import android.os.Build;
 
-import java.util.List;
+import java.net.InetAddress;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -14,227 +15,213 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+/**
+ * 思路：
+ * 1. addAllowedApplication / addDisallowedApplication 全部变成空操作 -> 名单为空 = 全局 VPN，
+ *    不再枚举已安装应用（避开包可见性限制，也覆盖之后新装的应用）。
+ * 2. 唯一例外：放行 VPN App 对自己的排除，并在 establish 里补一次，避免自己的流量回环进 TUN。
+ * 3. establish 前（API 33+）用 excludeRoute 排除局域网 / 国内网段。
+ *
+ * 需要 compileSdk >= 33。LSPosed 作用域建议只勾选目标 VPN App。
+ */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[ForceGlobal] ";
 
+    // 原表原样保留。注意：很多整段 /8 并非中国专属，建议换成按 APNIC 数据生成的精确列表。
+    // 另外 10.0.0.0/8、172.16.0.0/12 若与 VPN 自己的虚拟网卡/DNS 地址重叠，会导致 DNS 失效。
+    private static final String[] ROUTES = new String[] {
+            // 局域网 / 私有地址
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+
+            // 国内常见 IPv4 大段，网页分流测试用
+            "1.0.1.0/24",
+            "1.0.2.0/23",
+            "1.0.8.0/21",
+            "1.0.32.0/19",
+
+            "14.16.0.0/12",
+            "27.8.0.0/13",
+            "27.16.0.0/12",
+
+            "36.0.0.0/8",
+            "39.0.0.0/8",
+            "42.0.0.0/8",
+
+            "49.4.0.0/14",
+            "49.64.0.0/11",
+
+            "58.0.0.0/8",
+            "59.0.0.0/8",
+            "60.0.0.0/8",
+            "61.0.0.0/8",
+
+            "101.0.0.0/8",
+            "103.0.0.0/8",
+            "106.0.0.0/8",
+
+            "110.0.0.0/8",
+            "111.0.0.0/8",
+            "112.0.0.0/8",
+            "113.0.0.0/8",
+            "114.0.0.0/8",
+            "115.0.0.0/8",
+            "116.0.0.0/8",
+            "117.0.0.0/8",
+            "118.0.0.0/8",
+            "119.0.0.0/8",
+
+            "120.0.0.0/8",
+            "121.0.0.0/8",
+            "122.0.0.0/8",
+            "123.0.0.0/8",
+            "124.0.0.0/8",
+            "125.0.0.0/8",
+
+            "139.0.0.0/8",
+            "140.0.0.0/8",
+            "144.0.0.0/8",
+            "150.0.0.0/8",
+            "153.0.0.0/8",
+            "157.0.0.0/8",
+            "163.0.0.0/8",
+            "171.0.0.0/8",
+            "175.0.0.0/8",
+
+            "180.0.0.0/8",
+            "182.0.0.0/8",
+            "183.0.0.0/8",
+
+            "202.0.0.0/8",
+            "203.0.0.0/8",
+            "210.0.0.0/8",
+            "211.0.0.0/8",
+
+            "218.0.0.0/8",
+            "219.0.0.0/8",
+            "220.0.0.0/8",
+            "221.0.0.0/8",
+            "222.0.0.0/8",
+            "223.0.0.0/8"
+    };
+
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        // 每个进程只挂一次
+        if (!lpparam.isFirstApplication) {
+            return;
+        }
 
-        XposedBridge.log(TAG + "加载包名: " + lpparam.packageName);
+        hookAllowedApplication();
+        hookDisallowedApplication();
+        hookEstablish();
+    }
 
-        // -----------------------------------------------------------
-        // 1. 拦截黑名单，防止 VPN App 排除应用
-        // -----------------------------------------------------------
+    /** 名单永远为空 = 全局。 */
+    private void hookAllowedApplication() {
         try {
             XposedHelpers.findAndHookMethod(
-                    "android.net.VpnService$Builder",
-                    lpparam.classLoader,
-                    "addDisallowedApplication",
+                    VpnService.Builder.class,
+                    "addAllowedApplication",
                     String.class,
                     new XC_MethodHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            String pkg = String.valueOf(param.args[0]);
-
-                            XposedBridge.log(TAG + "拦截黑名单: " + pkg);
-
-                            // 直接返回 Builder 对象，跳过原方法
+                        protected void beforeHookedMethod(MethodHookParam param) {
                             param.setResult(param.thisObject);
                         }
                     }
             );
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Hook addDisallowedApplication 失败: " + t.getMessage());
+            XposedBridge.log(TAG + "Hook addAllowedApplication 失败: " + t);
         }
+    }
 
-        // -----------------------------------------------------------
-        // 2. Hook establish，在 VPN 建立前修改规则
-        // -----------------------------------------------------------
+    /** 吞掉别人的排除，只放行对自己的排除（防回环）。 */
+    private void hookDisallowedApplication() {
         try {
             XposedHelpers.findAndHookMethod(
-                    "android.net.VpnService$Builder",
-                    lpparam.classLoader,
-                    "establish",
+                    VpnService.Builder.class,
+                    "addDisallowedApplication",
+                    String.class,
                     new XC_MethodHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            Application app = AndroidAppHelper.currentApplication();
-
-                            if (app == null) {
-                                XposedBridge.log(TAG + "currentApplication 为空，跳过");
-                                return;
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            String pkg = (String) param.args[0];
+                            String me = currentPackage();
+                            if (pkg != null && pkg.equals(me)) {
+                                return; // 放行，执行原方法
                             }
-
-                            String myPkg = app.getPackageName();
-                            PackageManager pm = app.getPackageManager();
-                            Object builder = param.thisObject;
-
-                            XposedBridge.log(TAG + "正在处理 VPN App: " + myPkg);
-
-                            // 2.1 强制所有 App 加入 VPN 白名单
-                            addAllAppsToVpn(builder, pm, myPkg);
-
-                            // 2.2 安卓 13+ 排除国内 IP 路由，实现国内直连
-                            excludeChinaRoutes(builder);
+                            param.setResult(param.thisObject);
                         }
                     }
             );
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Hook establish 失败: " + t.getMessage());
+            XposedBridge.log(TAG + "Hook addDisallowedApplication 失败: " + t);
         }
     }
 
-    /**
-     * 把所有已安装 App 加入 VPN allowedApplication 白名单
-     */
-    private void addAllAppsToVpn(Object builder, PackageManager pm, String myPkg) {
+    private void hookEstablish() {
         try {
-            List<PackageInfo> packages = pm.getInstalledPackages(0);
+            XposedHelpers.findAndHookMethod(
+                    VpnService.Builder.class,
+                    "establish",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            VpnService.Builder builder = (VpnService.Builder) param.thisObject;
 
-            int count = 0;
+                            // 确保 VPN App 自己不进自己的 VPN（走上面放行的分支）
+                            String me = currentPackage();
+                            if (me != null) {
+                                try {
+                                    builder.addDisallowedApplication(me);
+                                } catch (Throwable t) {
+                                    XposedBridge.log(TAG + "自排除失败: " + t);
+                                }
+                            }
 
-            for (PackageInfo info : packages) {
-                if (info == null || info.packageName == null) {
-                    continue;
-                }
-
-                String pkg = info.packageName;
-
-                // 排除 VPN 自身，避免 VPN App 自己走自己的 VPN 导致异常
-                if (pkg.equals(myPkg)) {
-                    continue;
-                }
-
-                try {
-                    XposedHelpers.callMethod(
-                            builder,
-                            "addAllowedApplication",
-                            pkg
-                    );
-
-                    count++;
-                } catch (Throwable e) {
-                    XposedBridge.log(TAG + "添加白名单失败: " + pkg + " / " + e.getMessage());
-                }
-            }
-
-            XposedBridge.log(TAG + "全局白名单注入完成，共添加: " + count);
-
-        } catch (Throwable e) {
-            XposedBridge.log(TAG + "注入 App 白名单失败: " + e.getMessage());
+                            excludeRoutes(builder);
+                        }
+                    }
+            );
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "Hook establish 失败: " + t);
         }
     }
 
-    /**
-     * 排除国内 IP / 局域网 IP，不走 VPN
-     *
-     * Android 13 / API 33 以上支持 VpnService.Builder.excludeRoute(IpPrefix)
-     * 安卓 16 可以使用。
-     */
-    private void excludeChinaRoutes(Object builder) {
+    /** Android 13 / API 33+ 才有 excludeRoute。 */
+    @SuppressLint("NewApi")
+    private void excludeRoutes(VpnService.Builder builder) {
         if (Build.VERSION.SDK_INT < 33) {
-            XposedBridge.log(TAG + "当前系统低于 Android 13，不支持 excludeRoute，跳过国内直连");
+            XposedBridge.log(TAG + "系统低于 Android 13，跳过 excludeRoute");
             return;
         }
 
-        String[] routes = new String[] {
-                // 局域网 / 私有地址
-                "10.0.0.0/8",
-                "172.16.0.0/12",
-                "192.168.0.0/16",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-
-                // 国内常见 IPv4 大段，网页分流测试用
-                "1.0.1.0/24",
-                "1.0.2.0/23",
-                "1.0.8.0/21",
-                "1.0.32.0/19",
-
-                "14.16.0.0/12",
-                "27.8.0.0/13",
-                "27.16.0.0/12",
-
-                "36.0.0.0/8",
-                "39.0.0.0/8",
-                "42.0.0.0/8",
-
-                "49.4.0.0/14",
-                "49.64.0.0/11",
-
-                "58.0.0.0/8",
-                "59.0.0.0/8",
-                "60.0.0.0/8",
-                "61.0.0.0/8",
-
-                "101.0.0.0/8",
-                "103.0.0.0/8",
-                "106.0.0.0/8",
-
-                "110.0.0.0/8",
-                "111.0.0.0/8",
-                "112.0.0.0/8",
-                "113.0.0.0/8",
-                "114.0.0.0/8",
-                "115.0.0.0/8",
-                "116.0.0.0/8",
-                "117.0.0.0/8",
-                "118.0.0.0/8",
-                "119.0.0.0/8",
-
-                "120.0.0.0/8",
-                "121.0.0.0/8",
-                "122.0.0.0/8",
-                "123.0.0.0/8",
-                "124.0.0.0/8",
-                "125.0.0.0/8",
-
-                "139.0.0.0/8",
-                "140.0.0.0/8",
-                "144.0.0.0/8",
-                "150.0.0.0/8",
-                "153.0.0.0/8",
-                "157.0.0.0/8",
-                "163.0.0.0/8",
-                "171.0.0.0/8",
-                "175.0.0.0/8",
-
-                "180.0.0.0/8",
-                "182.0.0.0/8",
-                "183.0.0.0/8",
-
-                "202.0.0.0/8",
-                "203.0.0.0/8",
-                "210.0.0.0/8",
-                "211.0.0.0/8",
-
-                "218.0.0.0/8",
-                "219.0.0.0/8",
-                "220.0.0.0/8",
-                "221.0.0.0/8",
-                "222.0.0.0/8",
-                "223.0.0.0/8"
-        };
-
-        int success = 0;
+        int ok = 0;
         int failed = 0;
 
-        for (String cidr : routes) {
+        for (String cidr : ROUTES) {
             try {
-                Class<?> ipPrefixClass = Class.forName("android.net.IpPrefix");
-                Object ipPrefix = XposedHelpers.newInstance(ipPrefixClass, cidr);
-
-                XposedHelpers.callMethod(builder, "excludeRoute", ipPrefix);
-
-                success++;
-                XposedBridge.log(TAG + "国内直连路由成功: " + cidr);
+                int slash = cidr.indexOf('/');
+                InetAddress addr = InetAddress.getByName(cidr.substring(0, slash));
+                int prefixLen = Integer.parseInt(cidr.substring(slash + 1));
+                builder.excludeRoute(new IpPrefix(addr, prefixLen));
+                ok++;
             } catch (Throwable e) {
                 failed++;
-                XposedBridge.log(TAG + "国内直连路由失败: " + cidr + " / " + e.getMessage());
+                XposedBridge.log(TAG + "排除路由失败: " + cidr + " / " + e);
             }
         }
 
-        XposedBridge.log(TAG + "国内直连规则完成，成功: " + success + "，失败: " + failed);
+        XposedBridge.log(TAG + "排除路由完成，成功: " + ok + "，失败: " + failed);
+    }
+
+    private static String currentPackage() {
+        Application app = AndroidAppHelper.currentApplication();
+        return app != null ? app.getPackageName() : null;
     }
 }
