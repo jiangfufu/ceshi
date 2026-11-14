@@ -7,10 +7,13 @@ import android.os.Build;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.WeakHashMap;
 import java.util.zip.ZipEntry;
@@ -28,9 +31,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * 1. addAllowedApplication 全部吞掉；addDisallowedApplication 只放行对自己的排除
  *    -> 名单为空 = 全局 VPN。
  * 2. establish 前：自排除（防回环）+ excludeRoute（API 33+）。
- * 3. 路由表优先从模块 APK 的 assets/cn_routes.txt 读取（一行一个 CIDR，支持 IPv4/IPv6），
- *    没有则回退到内置的粗粒度列表。
- * 4. 记录 VPN 自己的 TUN 地址 / DNS，凡是包含这些地址的排除段一律跳过，避免 DNS 或回环失效。
+ * 3. 路由表只从模块 APK 的 assets/cn_routes.txt 读取（一行一个 CIDR，支持 IPv4/IPv6）。
+ *    读取不到 / 文件为空 -> 不排除任何路由，全部走 VPN。
+ * 4. 加载后自动合并重叠、相邻的网段，减少 excludeRoute 的条数。
+ * 5. 记录 VPN 自己的 TUN 地址 / DNS，凡是包含这些地址的排除段一律跳过，避免 DNS 或回环失效。
  *
  * 需要 compileSdk >= 33。LSPosed 作用域只勾选目标 VPN App。
  */
@@ -39,28 +43,11 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     private static final String TAG = "[ForceGlobal] ";
     private static final String ASSET_ROUTES = "assets/cn_routes.txt";
 
-    /** 局域网 / 私有地址（IPv4 + IPv6） */
+    /** 局域网 / 私有地址（IPv4 + IPv6），仅在成功读到 cn_routes.txt 时一起排除 */
     private static final String[] PRIVATE_ROUTES = {
             "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
             "127.0.0.0/8", "169.254.0.0/16",
             "fc00::/7", "fe80::/10"
-    };
-
-    /** 回退用：精确网段 */
-    private static final String[] FALLBACK_PRECISE = {
-            "1.0.1.0/24", "1.0.2.0/23", "1.0.8.0/21", "1.0.32.0/19",
-            "14.16.0.0/12", "27.8.0.0/13", "27.16.0.0/12",
-            "49.4.0.0/14", "49.64.0.0/11"
-    };
-
-    /** 回退用：粗粒度 /8（并非全是国内地址，仅作没有 cn_routes.txt 时的兜底） */
-    private static final int[] FALLBACK_SLASH8 = {
-            36, 39, 42, 58, 59, 60, 61, 101, 103, 106,
-            110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
-            120, 121, 122, 123, 124, 125,
-            139, 140, 144, 150, 153, 157, 163, 171, 175,
-            180, 182, 183, 202, 203, 210, 211,
-            218, 219, 220, 221, 222, 223
     };
 
     // ---------------------------------------------------------------- 状态
@@ -236,8 +223,14 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
             return;
         }
 
+        List<Route> list = routes();
+        if (list.isEmpty()) {
+            XposedBridge.log(TAG + "没有可用的路由表，不排除任何路由，全部走 VPN");
+            return;
+        }
+
         int ok = 0, skipped = 0, failed = 0;
-        for (Route r : routes()) {
+        for (Route r : list) {
             if (st.overlaps(r)) { // 包含 TUN / DNS 地址，排除会导致自己不通
                 skipped++;
                 continue;
@@ -255,24 +248,27 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     private synchronized List<Route> routes() {
         if (routes != null) return routes;
 
-        List<String> lines = new ArrayList<>(Arrays.asList(PRIVATE_ROUTES));
         List<String> fromAsset = readAssetLines();
-        if (fromAsset != null && !fromAsset.isEmpty()) {
-            lines.addAll(fromAsset);
-            XposedBridge.log(TAG + "从 " + ASSET_ROUTES + " 加载 " + fromAsset.size() + " 条");
-        } else {
-            lines.addAll(Arrays.asList(FALLBACK_PRECISE));
-            for (int o : FALLBACK_SLASH8) lines.add(o + ".0.0.0/8");
-            XposedBridge.log(TAG + "未找到 " + ASSET_ROUTES + "，使用内置粗粒度列表");
+        if (fromAsset == null || fromAsset.isEmpty()) {
+            XposedBridge.log(TAG + "未找到或读不到 " + ASSET_ROUTES);
+            routes = Collections.emptyList();
+            return routes;
         }
 
-        List<Route> out = new ArrayList<>(lines.size());
+        List<String> lines = new ArrayList<>(Arrays.asList(PRIVATE_ROUTES));
+        lines.addAll(fromAsset);
+
+        List<Route> parsed = new ArrayList<>(lines.size());
         for (String s : lines) {
             Route r = parse(s);
-            if (r != null) out.add(r);
+            if (r != null) parsed.add(r);
         }
-        routes = out;
-        return out;
+
+        List<Route> merged = merge(parsed);
+        XposedBridge.log(TAG + "从 " + ASSET_ROUTES + " 加载 " + fromAsset.size()
+                + " 条，合并后共 " + merged.size() + " 条");
+        routes = merged;
+        return routes;
     }
 
     /** 从模块 APK 里读 assets，不依赖目标进程的文件权限。 */
@@ -304,7 +300,7 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
             if (slash <= 0) return null;
             InetAddress a = toAddress(cidr.substring(0, slash));
             if (a == null) return null;
-            int len = Integer.parseInt(cidr.substring(slash + 1));
+            int len = Integer.parseInt(cidr.substring(slash + 1).trim());
             if (len < 0 || len > a.getAddress().length * 8) return null;
             return new Route(a, len);
         } catch (Throwable t) {
@@ -322,5 +318,81 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    // ---------------------------------------------------------------- 合并网段
+
+    /** 合并重叠 / 相邻的网段，IPv4 与 IPv6 分开处理。 */
+    private static List<Route> merge(List<Route> in) {
+        List<Route> v4 = new ArrayList<>();
+        List<Route> v6 = new ArrayList<>();
+        for (Route r : in) {
+            if (r.addr.getAddress().length == 4) v4.add(r);
+            else v6.add(r);
+        }
+        List<Route> out = new ArrayList<>();
+        out.addAll(mergeFamily(v4, 4));
+        out.addAll(mergeFamily(v6, 16));
+        return out;
+    }
+
+    private static List<Route> mergeFamily(List<Route> list, int bytes) {
+        List<Route> out = new ArrayList<>();
+        if (list.isEmpty()) return out;
+        final int bits = bytes * 8;
+
+        // 每个网段 -> [起点, 终点]
+        List<BigInteger[]> ranges = new ArrayList<>(list.size());
+        for (Route r : list) {
+            int host = bits - r.len;
+            BigInteger start = new BigInteger(1, r.addr.getAddress()).shiftRight(host).shiftLeft(host);
+            BigInteger end = start.add(BigInteger.ONE.shiftLeft(host)).subtract(BigInteger.ONE);
+            ranges.add(new BigInteger[]{start, end});
+        }
+        Collections.sort(ranges, new Comparator<BigInteger[]>() {
+            @Override
+            public int compare(BigInteger[] a, BigInteger[] b) {
+                return a[0].compareTo(b[0]);
+            }
+        });
+
+        // 合并重叠 / 相邻区间
+        List<BigInteger[]> merged = new ArrayList<>();
+        BigInteger[] cur = ranges.get(0);
+        for (int i = 1; i < ranges.size(); i++) {
+            BigInteger[] nx = ranges.get(i);
+            if (nx[0].compareTo(cur[1].add(BigInteger.ONE)) <= 0) {
+                if (nx[1].compareTo(cur[1]) > 0) cur = new BigInteger[]{cur[0], nx[1]};
+            } else {
+                merged.add(cur);
+                cur = nx;
+            }
+        }
+        merged.add(cur);
+
+        // 区间 -> 尽量少的 CIDR
+        for (BigInteger[] rg : merged) {
+            BigInteger start = rg[0];
+            BigInteger end = rg[1];
+            while (start.compareTo(end) <= 0) {
+                int align = start.signum() == 0 ? bits : start.getLowestSetBit();
+                int fit = end.subtract(start).add(BigInteger.ONE).bitLength() - 1;
+                int k = Math.min(align, fit);
+                try {
+                    out.add(new Route(InetAddress.getByAddress(toBytes(start, bytes)), bits - k));
+                } catch (Throwable ignored) {
+                }
+                start = start.add(BigInteger.ONE.shiftLeft(k));
+            }
+        }
+        return out;
+    }
+
+    private static byte[] toBytes(BigInteger v, int bytes) {
+        byte[] raw = v.toByteArray();
+        byte[] out = new byte[bytes];
+        int copy = Math.min(raw.length, bytes);
+        System.arraycopy(raw, raw.length - copy, out, bytes - copy, copy);
+        return out;
     }
 }
