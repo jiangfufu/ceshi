@@ -32,7 +32,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *    -> 名单为空 = 全局 VPN。
  * 2. establish 前：自排除（防回环）+ excludeRoute（API 33+）。
  * 3. 路由表只从模块 APK 的 assets/cn_routes.txt 读取（一行一个 CIDR，支持 IPv4/IPv6）。
- *    读取不到 / 文件为空 -> 不排除任何路由，全部走 VPN。
+ *    读取不到 / 文件为空 -> 只排除局域网地址，其余全部走 VPN。
+ *    局域网 / 私有地址无论如何都直连。
  * 4. 加载后自动合并重叠、相邻的网段，减少 excludeRoute 的条数。
  * 5. 记录 VPN 自己的 TUN 地址 / DNS，凡是包含这些地址的排除段一律跳过，避免 DNS 或回环失效。
  *
@@ -43,7 +44,7 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     private static final String TAG = "[ForceGlobal] ";
     private static final String ASSET_ROUTES = "assets/cn_routes.txt";
 
-    /** 局域网 / 私有地址（IPv4 + IPv6），仅在成功读到 cn_routes.txt 时一起排除 */
+    /** 局域网 / 私有地址（IPv4 + IPv6），始终排除（直连） */
     private static final String[] PRIVATE_ROUTES = {
             "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
             "127.0.0.0/8", "169.254.0.0/16",
@@ -248,15 +249,16 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     private synchronized List<Route> routes() {
         if (routes != null) return routes;
 
-        List<String> fromAsset = readAssetLines();
-        if (fromAsset == null || fromAsset.isEmpty()) {
-            XposedBridge.log(TAG + "未找到或读不到 " + ASSET_ROUTES);
-            routes = Collections.emptyList();
-            return routes;
-        }
-
+        // 局域网地址始终排除（直连），不管有没有 cn_routes.txt
         List<String> lines = new ArrayList<>(Arrays.asList(PRIVATE_ROUTES));
-        lines.addAll(fromAsset);
+
+        List<String> fromAsset = readAssetLines();
+        boolean hasAsset = fromAsset != null && !fromAsset.isEmpty();
+        if (hasAsset) {
+            lines.addAll(fromAsset);
+        } else {
+            XposedBridge.log(TAG + "未找到或读不到 " + ASSET_ROUTES + "，仅排除局域网地址，其余全部走 VPN");
+        }
 
         List<Route> parsed = new ArrayList<>(lines.size());
         for (String s : lines) {
@@ -265,8 +267,10 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
         }
 
         List<Route> merged = merge(parsed);
-        XposedBridge.log(TAG + "从 " + ASSET_ROUTES + " 加载 " + fromAsset.size()
-                + " 条，合并后共 " + merged.size() + " 条");
+        if (hasAsset) {
+            XposedBridge.log(TAG + "从 " + ASSET_ROUTES + " 加载 " + fromAsset.size()
+                    + " 条，加上局域网后合并为 " + merged.size() + " 条");
+        }
         routes = merged;
         return routes;
     }
